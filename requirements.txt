@@ -1,0 +1,6 @@
+# Core dependencies for ai-json-cleanroom
+# The library works with stdlib only, no required dependencies!
+
+# Optional: Fast JSON parsing (3.6x faster)
+# Uncomment to install:
+# orjson>=3.0.0
