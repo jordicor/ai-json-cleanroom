@@ -395,6 +395,7 @@ def _sanitize_curly_quotes(text: str) -> str:
     out: List[str] = []
     in_string = False
     escape = False
+    quote_kind: Optional[str] = None  # "straight" or "curly"
     for idx, ch in enumerate(text):
         if in_string:
             if escape:
@@ -406,17 +407,23 @@ def _sanitize_curly_quotes(text: str) -> str:
                 escape = True
                 continue
             if ch == '"':
-                out.append('"')
-                in_string = False
-                continue
-            if ch in DOUBLE_CURLY_QUOTES:
-                nxt, _ = _next_non_ws(text, idx + 1)
-                if nxt is None or nxt in {',', '}', ']', ':'}:
-                    # Treat as string terminator.
+                if quote_kind == "straight":
                     out.append('"')
                     in_string = False
+                    quote_kind = None
                 else:
-                    # Treat as literal quote inside the string.
+                    out.append('\\"')
+                continue
+            if ch in DOUBLE_CURLY_QUOTES:
+                if quote_kind == "curly":
+                    nxt, _ = _next_non_ws(text, idx + 1)
+                    if nxt is None or nxt in {',', '}', ']', ':'}:
+                        out.append('"')
+                        in_string = False
+                        quote_kind = None
+                    else:
+                        out.append('\\"')
+                else:
                     out.append('\\"')
                 continue
             if ch in SINGLE_CURLY_QUOTES:
@@ -427,10 +434,12 @@ def _sanitize_curly_quotes(text: str) -> str:
             if ch == '"':
                 out.append('"')
                 in_string = True
+                quote_kind = "straight"
                 continue
             if ch in DOUBLE_CURLY_QUOTES:
                 out.append('"')
                 in_string = True
+                quote_kind = "curly"
                 continue
             if ch in SINGLE_CURLY_QUOTES:
                 out.append("'")
