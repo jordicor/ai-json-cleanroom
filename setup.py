@@ -1,13 +1,13 @@
 """Setup configuration for ai-json-cleanroom."""
 
-from setuptools import setup, find_packages
+from setuptools import setup
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
     name="ai-json-cleanroom",
-    version="1.1.0",
+    version="1.2.0",
     author="AI JSON Cleanroom Contributors",
     description="Robust post-processing layer for AI-generated JSON outputs",
     long_description=long_description,

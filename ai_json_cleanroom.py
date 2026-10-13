@@ -2,9 +2,9 @@
 
 """
 A compact, dependency-optional JSON validator tailored for AI model outputs.
-This version prefers `orjson` for speed/strictness and automatically falls back
-to the stdlib `json` where `orjson` is limited (e.g., indent > 2, ensure_ascii=True)
-or when `orjson` raises for a given input.
+Parsing uses stdlib `json` with an object-pairs hook to reject duplicate keys
+before any dictionary can overwrite them. Serialization prefers `orjson` and
+falls back to stdlib for unsupported options (e.g., indent > 2, ensure_ascii=True).
 
 Features
 --------
@@ -18,6 +18,8 @@ Features
    a) Simple JSON Schema subset (Draft-like):
       - type: "object"|"array"|"string"|"number"|"integer"|"boolean"|"null" (or list of types)
       - required, properties, patternProperties, additionalProperties (bool|schema)
+        (when additionalProperties/additionalItems is false, undeclared keys/items
+         are rejected by default; set additional_properties_behavior="strip" to clean)
       - items (schema or tuple-validation list), additionalItems
       - enum, const, anyOf, oneOf, allOf
       - string: minLength, maxLength, pattern, allow_empty
@@ -25,6 +27,24 @@ Features
       - number/integer: minimum, maximum, exclusiveMinimum, exclusiveMaximum, multipleOf
       - object/array/string: allow_empty
       - accepts camelCase or snake_case keywords (e.g., minLength or min_length)
+
+   Input-safety limits:
+      - The schema itself is admitted only after a complexity pre-pass
+        (validate_json_schema_complexity: max nesting depth, max
+        node count, max combinatorial product of nested oneOf/anyOf/type
+        unions). Over-complex schemas are rejected with a structured
+        ``schema_too_complex`` issue before any work starts, preventing
+        RecursionError and combinatorial-probe explosions.
+      - User regexes (``pattern``, ``patternProperties``, expectation
+        ``pattern``) are refused when longer than MAX_PATTERN_LENGTH (500) or
+        when they nest a variable-width quantifier inside another quantifier
+        (e.g. ``(a+)+$``), the classic catastrophic-backtracking shape.
+        Residual risk: overlapping-alternation ReDoS such as ``(a|aa)+$`` is
+        not detected by this check and remains possible within the length cap.
+        The stdlib ``re`` engine does not provide a matching timeout.
+      - Any RecursionError from deeply nested input/schema is converted into
+        a structured ``recursion_limit`` issue, preserving the non-throwing
+        contract.
 
    b) Expectations (path-based checks):
       - Each expectation is a dict with:
@@ -70,7 +90,8 @@ Public API
 ----------
 - validate_ai_json(input_data, schema=None, expectations=None, options=None) -> ValidationResult
 - Classes: ValidationResult, ValidationIssue, ValidateOptions, ErrorCode
-- Helpers (advanced): extract_json_payload, detect_truncation
+- Helpers: validate_loose_json, make_loose_json_validate_options,
+  extract_json_payload, detect_truncation
 
 CLI (optional)
 --------------
@@ -86,24 +107,194 @@ New CLI flags:
 
 from __future__ import annotations
 
+import argparse
+import copy
 import re
 import sys
-import argparse
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union, Iterable, Callable
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+
+try:  # Python 3.11+
+    from re import _parser as _re_parser
+except ImportError:  # pragma: no cover - Python <= 3.10 fallback
+    import sre_parse as _re_parser  # type: ignore[no-redef]
+
+__version__ = "1.2.0"
+
+JSON_SCHEMA_MAX_DEPTH = 25
+JSON_SCHEMA_MAX_NODES = 1000
+JSON_SCHEMA_MAX_COMBINATIONS = 10_000
+
+
+def validate_json_schema_complexity(
+    schema: Any,
+    *,
+    max_depth: int = JSON_SCHEMA_MAX_DEPTH,
+    max_nodes: int = JSON_SCHEMA_MAX_NODES,
+    max_combinations: int = JSON_SCHEMA_MAX_COMBINATIONS,
+) -> None:
+    """
+    Reject schemas that exceed the validation complexity limits.
+
+    Iterative pre-pass (no recursion, so it cannot itself overflow the stack)
+    over the raw schema structure measuring three metrics:
+
+    - maximum nesting depth, counting every dict/list descent from the root;
+    - total number of schema nodes (dicts) visited;
+    - accumulated combinatorial product: the variant counts of ``oneOf``,
+      ``anyOf`` and list-valued ``type`` multiply as the traversal descends,
+      bounding repeated validation of combinator branches.
+
+    Non-dict input is a no-op (a JSON Schema boolean or scalar carries no
+    traversal cost). Shared/repeated substructures are counted once per visit,
+    which keeps the estimate conservative.
+
+    Args:
+        schema: Raw JSON Schema structure (usually a dict).
+        max_depth: Maximum allowed nesting depth from the root.
+        max_nodes: Maximum allowed number of visited schema nodes.
+        max_combinations: Maximum allowed accumulated combinatorial product.
+
+    Raises:
+        ValueError: when any ceiling is exceeded.
+    """
+
+    if not isinstance(schema, dict):
+        return
+
+    nodes = 0
+    stack: List[Any] = [(schema, 1, 1)]
+    while stack:
+        node, depth, combinations = stack.pop()
+        if depth > max_depth:
+            raise ValueError(
+                f"JSON Schema nesting depth exceeds the limit of {max_depth} levels"
+            )
+        if isinstance(node, dict):
+            nodes += 1
+            if nodes > max_nodes:
+                raise ValueError(
+                    f"JSON Schema exceeds the limit of {max_nodes} schema nodes"
+                )
+            node_combinations = combinations
+            for combinator in ("oneOf", "anyOf"):
+                options = node.get(combinator)
+                if isinstance(options, list) and options:
+                    node_combinations *= len(options)
+            json_type = node.get("type")
+            if isinstance(json_type, list) and json_type:
+                node_combinations *= len(json_type)
+            if node_combinations > max_combinations:
+                raise ValueError(
+                    f"JSON Schema combinatorial complexity exceeds the limit of "
+                    f"{max_combinations} (nested oneOf/anyOf/type unions)"
+                )
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    stack.append((value, depth + 1, node_combinations))
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    stack.append((item, depth + 1, combinations))
 
 
 def _reject_invalid_constant(value: str):
     raise ValueError(f"Invalid constant '{value}' in JSON input.")
 
 
-# --------------------------- JSON Engine (orjson-first) ---------------------------
+class DuplicateJSONKeyError(ValueError):
+    """Reject ambiguous JSON without retaining a private key or value."""
+
+    def __init__(self) -> None:
+        super().__init__("JSON object keys must be unique.")
+
+
+def _unique_object_pairs(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJSONKeyError()
+        result[key] = value
+    return result
+
+
+# --------------------- User-regex safety ---------------------
+
+# Ceiling for the length of any user-supplied regex (schema ``pattern`` /
+# ``patternProperties`` keys, expectation ``pattern``). Bounds both compile
+# cost and the search space of pathological expressions.
+MAX_PATTERN_LENGTH = 500
+
+
+def _iter_regex_subpatterns(value: Any) -> Iterable[Any]:
+    """Yield SubPattern objects nested inside a parsed-regex token argument."""
+    if isinstance(value, _re_parser.SubPattern):
+        yield value
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_regex_subpatterns(item)
+
+
+def _has_nested_repeat(tokens: list, inside_repeat: bool) -> bool:
+    """Recursively detect a variable-width quantifier inside another quantifier."""
+    for op, arg in tokens:
+        if op in (_re_parser.MAX_REPEAT, _re_parser.MIN_REPEAT):
+            min_repeat, max_repeat, subpattern = arg
+            variable = (
+                max_repeat == _re_parser.MAXREPEAT or max_repeat != min_repeat
+            )
+            if inside_repeat and variable:
+                return True
+            if _has_nested_repeat(subpattern.data, inside_repeat or variable):
+                return True
+        else:
+            for subpattern in _iter_regex_subpatterns(arg):
+                if _has_nested_repeat(subpattern.data, inside_repeat):
+                    return True
+    return False
+
+
+def _regex_has_nested_quantifiers(pattern: str) -> bool:
+    """
+    Detect variable-width quantifiers nested inside another quantifier.
+
+    Patterns like ``(a+)+`` cause catastrophic backtracking in the stdlib
+    ``re`` engine (ReDoS). Fixed-width inner repeats such as
+    ``(\\d{4})+`` are allowed.
+    """
+    try:
+        parsed = _re_parser.parse(pattern)
+    except Exception:
+        # Not a safety concern: re.compile() raises the syntax error later.
+        return False
+    return _has_nested_repeat(parsed.data, inside_repeat=False)
+
+
+def _pattern_rejection_reason(pattern: Any) -> Optional[str]:
+    """
+    Return why a user-supplied regex is refused, or None when it is accepted.
+
+    Rejects non-strings, patterns longer than MAX_PATTERN_LENGTH, and nested
+    quantifiers. Residual risk (documented in the module docstring):
+    overlapping-alternation ReDoS such as ``(a|aa)+$`` is not detected by
+    this check and remains possible on patterns within the length cap.
+    """
+    if not isinstance(pattern, str):
+        return f"expected a string, got {type(pattern).__name__}"
+    if len(pattern) > MAX_PATTERN_LENGTH:
+        return f"length {len(pattern)} exceeds the limit of {MAX_PATTERN_LENGTH}"
+    if _regex_has_nested_quantifiers(pattern):
+        return "quantifiers nested inside another quantifier (catastrophic backtracking)"
+    return None
+
+
+# --------------------------- JSON Engine ---------------------------
 
 class JSONEngine:
     """
-    A thin facade over orjson (preferred) with automatic fallback to stdlib json.
-    - loads(): try orjson.loads first, fallback to json.loads.
+    Strict unique-key parsing, with orjson preferred for serialization.
+    - loads(): use stdlib object_pairs_hook; orjson discards duplicate keys.
     - dumps(): use orjson when possible (indent in {None, 2} and ensure_ascii=False),
                otherwise fallback to json.dumps with requested options.
     Exposes *with_backend variants to return which backend was actually used.
@@ -123,26 +314,7 @@ class JSONEngine:
 
     # ---------- loads ----------
     def loads(self, s: Union[str, bytes, bytearray], *, sanitize_curly_quotes: bool = True) -> Any:
-        if isinstance(s, str):
-            if sanitize_curly_quotes:
-                s = _sanitize_curly_quotes(s)
-        elif isinstance(s, (bytes, bytearray)):
-            if sanitize_curly_quotes:
-                decoded = s.decode("utf-8", errors="replace")
-                decoded = _sanitize_curly_quotes(decoded)
-                s = decoded.encode("utf-8")
-
-        if self.orjson is not None:
-            try:
-                if isinstance(s, (bytes, bytearray)):
-                    return self.orjson.loads(s)
-                return self.orjson.loads(s.encode("utf-8"))
-            except Exception:
-                # Fallback to stdjson
-                pass
-        if isinstance(s, (bytes, bytearray)):
-            s = s.decode("utf-8", errors="replace")
-        return self.stdjson.loads(s, parse_constant=_reject_invalid_constant)
+        return self.loads_with_backend(s, sanitize_curly_quotes=sanitize_curly_quotes)[0]
 
     def loads_with_backend(
         self,
@@ -159,17 +331,12 @@ class JSONEngine:
                 decoded = _sanitize_curly_quotes(decoded)
                 s = decoded.encode("utf-8")
 
-        if self.orjson is not None:
-            try:
-                if isinstance(s, (bytes, bytearray)):
-                    return self.orjson.loads(s), "orjson"
-                return self.orjson.loads(s.encode("utf-8")), "orjson"
-            except Exception:
-                # Fallback to stdjson
-                pass
         if isinstance(s, (bytes, bytearray)):
             s = s.decode("utf-8", errors="replace")
-        return self.stdjson.loads(s, parse_constant=_reject_invalid_constant), "json"
+        return self.stdjson.loads(
+            s, parse_constant=_reject_invalid_constant,
+            object_pairs_hook=_unique_object_pairs,
+        ), "json"
 
     # ---------- dumps ----------
     def dumps(
@@ -228,6 +395,7 @@ json_engine = JSONEngine()
 
 class ErrorCode(str, Enum):
     PARSE_ERROR = "parse_error"
+    DUPLICATE_KEY = "duplicate_key"
     TRUNCATED = "truncated"
     MISSING_REQUIRED = "missing_required"
     TYPE_MISMATCH = "type_mismatch"
@@ -254,7 +422,11 @@ class ErrorCode(str, Enum):
     PATH_NOT_FOUND = "path_not_found"
     EXPECTATION_FAILED = "expectation_failed"
     UNKNOWN = "unknown"
+    SCHEMA_TOO_COMPLEX = "schema_too_complex"  # user schema breached complexity ceilings
+    RECURSION_LIMIT = "recursion_limit"  # nesting too deep to process safely
+    UNSAFE_PATTERN = "unsafe_pattern"  # user regex refused (length / nested quantifiers)
     REPAIRED = "repaired"  # non-error warning indicating a repair was applied
+    STRIPPED_ADDITIONAL = "stripped_additional"  # non-error warning: undeclared props/items dropped
 
 
 @dataclass
@@ -325,9 +497,34 @@ class ValidateOptions:
     # Each hook: (text: str, options: ValidateOptions) -> (new_text: str, changes: int, meta: Dict[str, Any])
     custom_repair_hooks: Optional[List[Callable[[str, "ValidateOptions"], Tuple[str, int, Dict[str, Any]]]]] = None
 
+    # Reject undeclared keys/items by default, as in earlier releases.
+    # Only an explicit "strip" opts into removal (with warnings).
+    additional_properties_behavior: str = "fail"
+
     def __post_init__(self):
         if self.strict and not self.stop_on_first_error:
             self.stop_on_first_error = True
+
+
+def make_loose_json_validate_options() -> ValidateOptions:
+    """Build fresh options for extracting and repairing AI JSON without a schema.
+
+    Extract the first JSON
+    object/array from common AI wrappers, repair conservative syntax slips, then
+    validate expectations. A fresh instance is returned on every call so no
+    shared mutable options object can be changed by another caller.
+    """
+
+    return ValidateOptions(
+        strict=True,
+        extract_json=True,
+        tolerate_trailing_commas=True,
+        allow_json_in_code_fences=True,
+        allow_bare_top_level_scalars=False,
+        enable_safe_repairs=True,
+        allow_json5_like=True,
+        normalize_curly_quotes="auto",
+    )
 
 
 # ----------------------------- Utilities -----------------------------
@@ -614,6 +811,8 @@ def _parse_with_options(
         try:
             obj, backend = json_engine.loads_with_backend(s, sanitize_curly_quotes=False)
             return obj, backend, False
+        except DuplicateJSONKeyError:
+            raise
         except Exception:
             obj, backend = json_engine.loads_with_backend(s, sanitize_curly_quotes=True)
             return obj, backend, True
@@ -627,6 +826,8 @@ def _loads_ok(s: str, options: ValidateOptions) -> bool:
     try:
         _parse_with_options(s, options)
         return True
+    except DuplicateJSONKeyError:
+        raise
     except Exception:
         return False
 
@@ -1038,7 +1239,6 @@ def _repair_replace_constants(s: str, replace_nans_infinities: bool = True) -> T
                 while j < n and is_word_char(s[j]):
                     j += 1
                 token = s[i:j]
-                lower = token.lower()
                 replaced = None
                 if token in ("True", "False", "None"):
                     mapping = {"True": "true", "False": "false", "None": "null"}
@@ -1097,11 +1297,9 @@ def _repair_strip_js_comments(s: str) -> Tuple[str, int, Dict[str, int]]:
                 if nxt == '*':
                     # block comment
                     i += 2
-                    closed = False
                     while i + 1 < n:
                         if s[i] == '*' and s[i + 1] == '/':
                             i += 2
-                            closed = True
                             break
                         i += 1
                     removed += 1; counts["block"] += 1
@@ -1140,9 +1338,14 @@ def attempt_safe_json_repair(payload: str, options: ValidateOptions) -> Tuple[Op
         try:
             _parse_with_options(txt, options)
             return True
+        except DuplicateJSONKeyError:
+            raise
         except Exception:
             return False
 
+    # This advanced helper can also be called directly. Never let a custom
+    # repair hook erase a duplicate that the original parser already detects.
+    _try_parse(payload)
     candidate = payload
 
     # Pass A: escape inner quotes + controls in strings
@@ -1236,6 +1439,8 @@ def attempt_safe_json_repair(payload: str, options: ValidateOptions) -> Tuple[Op
         for hook in options.custom_repair_hooks:
             try:
                 repaired, changes, hook_meta = hook(candidate, options)
+            except DuplicateJSONKeyError:
+                raise
             except Exception as ex:
                 # Skip failing hook but record attempt
                 info.setdefault("hooks_errors", []).append(
@@ -1271,11 +1476,34 @@ class SimpleJSONSchemaValidator:
     def __init__(self, options: Optional[ValidateOptions] = None):
         self.options = options or ValidateOptions()
         self.errors: List[ValidationIssue] = []
+        self.warnings: List[ValidationIssue] = []
         self.stop_on_first_error = bool(self.options.stop_on_first_error or self.options.strict)
+        # Only an explicit "strip" permits removing undeclared keys/items.
+        self.strip_additional = (
+            (self.options.additional_properties_behavior or "fail").lower() == "strip"
+        )
+        # During combinator branch probing (anyOf/oneOf/allOf) validation runs in
+        # dry-run mode: undeclared keys/items are tolerated but NOT stripped, so a
+        # trial branch never mutates the shared value. The real strip is applied
+        # once, against the matched branch, by _apply_subschema().
+        self._dry_run = False
 
     def validate(self, data: Any, schema: Dict[str, Any], path: str = "$") -> List[ValidationIssue]:
+        """Validate data against the schema, never raising.
+
+        A RecursionError from deeply nested schema/data is converted into a
+        structured issue, preserving the non-throwing contract.
+        """
         self.errors = []
-        self._validate(data, schema, path)
+        self.warnings = []
+        try:
+            self._validate(data, schema, path)
+        except RecursionError:
+            self._err(
+                ErrorCode.RECURSION_LIMIT,
+                path,
+                "Validation aborted: schema/data nesting exceeded the recursion budget.",
+            )
         return self.errors
 
     # --- Core dispatcher ---
@@ -1284,7 +1512,19 @@ class SimpleJSONSchemaValidator:
         if self.stop_on_first_error and self.errors:
             return
 
-        # Handle combinators first to respect unions
+        # A subschema must be an object. Malformed (non-dict) subschemas — e.g. a
+        # stray scalar inside anyOf/oneOf/allOf or a bad property spec — are
+        # reported as a structured error instead of raising, preserving the
+        # non-throwing contract. Inside a combinator probe this naturally counts
+        # the offending branch as a non-match.
+        if not isinstance(schema, dict):
+            self._err(ErrorCode.UNKNOWN, path,
+                      f"Invalid subschema: expected object, got {type(schema).__name__}.")
+            return
+
+        # Handle combinators first to respect unions.
+        # additionalProperties only sees properties declared at its own level.
+        # The public API checks the final cleaned result again if stripping ran.
         for comb in ("anyOf", "oneOf", "allOf"):
             if comb in schema:
                 getattr(self, f"_validate_{comb.lower()}")(value, schema[comb], path)
@@ -1297,7 +1537,8 @@ class SimpleJSONSchemaValidator:
         nullable = bool(schema.get("nullable", False))
         if typespec is not None:
             if value is None:
-                if not nullable and not (isinstance(typespec, list) and "null" in typespec):
+                if (not nullable and typespec != "null"
+                        and not (isinstance(typespec, list) and "null" in typespec)):
                     self._err(ErrorCode.TYPE_MISMATCH, path, f"Expected type {typespec}, got null.")
                     return
             else:
@@ -1360,11 +1601,21 @@ class SimpleJSONSchemaValidator:
         pattern_compiled: List[Tuple[re.Pattern, Dict[str, Any]]] = []
         if isinstance(pattern_props, dict):
             for patt, subschema in pattern_props.items():
+                rejection = _pattern_rejection_reason(patt)
+                if rejection is not None:
+                    self._err(
+                        ErrorCode.UNSAFE_PATTERN,
+                        path,
+                        f"Rejected patternProperties key: {rejection}.",
+                        detail={"pattern_preview": patt[:80] if isinstance(patt, str) else None},
+                    )
+                    continue
                 try:
                     pattern_compiled.append((re.compile(patt), subschema))
                 except re.error:
                     self._err(ErrorCode.PATTERN_MISMATCH, path, f"Invalid regex in patternProperties: {patt!r}.")
 
+        keys_to_strip: List[str] = []
         for key, val in obj.items():
             if key in matched_keys:
                 continue
@@ -1376,9 +1627,28 @@ class SimpleJSONSchemaValidator:
             if not matched_by_pattern:
                 # additionalProperties
                 if additional_props is False:
-                    self._err(ErrorCode.ADDITIONAL_PROPERTY, f"{path}.{key}", f"Additional property '{key}' not allowed.")
+                    if self.strip_additional:
+                        # Dry-run (combinator probe): tolerate without mutating.
+                        if not self._dry_run:
+                            keys_to_strip.append(key)
+                    else:
+                        self._err(ErrorCode.ADDITIONAL_PROPERTY, f"{path}.{key}", f"Additional property '{key}' not allowed.")
                 elif isinstance(additional_props, dict):
                     self._validate(val, additional_props, f"{path}.{key}")
+
+        # Drop undeclared properties (strip mode) after iterating to keep the
+        # object valid against ``additionalProperties: false`` without failing.
+        if keys_to_strip:
+            for key in keys_to_strip:
+                obj.pop(key, None)
+            self._warn(
+                ErrorCode.STRIPPED_ADDITIONAL,
+                path,
+                f"Dropped {len(keys_to_strip)} undeclared "
+                f"{'property' if len(keys_to_strip) == 1 else 'properties'}: "
+                f"{', '.join(keys_to_strip)}.",
+                detail={"stripped": list(keys_to_strip)},
+            )
 
         # allow_empty for object?
         allow_empty = _kw(schema, "allow_empty", "allowEmpty", default=True)
@@ -1421,7 +1691,20 @@ class SimpleJSONSchemaValidator:
                     self._validate(arr[i], item_schema, f"{path}[{i}]")
             if len(arr) > len(items_schema):
                 if additional_items is False:
-                    self._err(ErrorCode.ADDITIONAL_ITEMS, path, "Additional array items not allowed.")
+                    if self.strip_additional:
+                        # Dry-run (combinator probe): tolerate without truncating.
+                        if not self._dry_run:
+                            dropped = len(arr) - len(items_schema)
+                            del arr[len(items_schema):]
+                            self._warn(
+                                ErrorCode.STRIPPED_ADDITIONAL,
+                                path,
+                                f"Dropped {dropped} undeclared array "
+                                f"{'item' if dropped == 1 else 'items'}.",
+                                detail={"dropped_count": dropped},
+                            )
+                    else:
+                        self._err(ErrorCode.ADDITIONAL_ITEMS, path, "Additional array items not allowed.")
                 elif isinstance(additional_items, dict):
                     for i in range(len(items_schema), len(arr)):
                         self._validate(arr[i], additional_items, f"{path}[{i}]")
@@ -1444,11 +1727,20 @@ class SimpleJSONSchemaValidator:
             self._err(ErrorCode.MAX_LENGTH, path, f"String length {len(s)} > maxLength {max_len}.")
         patt = schema.get("pattern")
         if patt is not None:
-            try:
-                if re.search(patt, s) is None:
-                    self._err(ErrorCode.PATTERN_MISMATCH, path, f"String does not match pattern {patt!r}.")
-            except re.error:
-                self._err(ErrorCode.PATTERN_MISMATCH, path, f"Invalid regex in pattern: {patt!r}.")
+            rejection = _pattern_rejection_reason(patt)
+            if rejection is not None:
+                self._err(
+                    ErrorCode.UNSAFE_PATTERN,
+                    path,
+                    f"Rejected pattern: {rejection}.",
+                    detail={"pattern_preview": patt[:80] if isinstance(patt, str) else None},
+                )
+            else:
+                try:
+                    if re.search(patt, s) is None:
+                        self._err(ErrorCode.PATTERN_MISMATCH, path, f"String does not match pattern {patt!r}.")
+                except re.error:
+                    self._err(ErrorCode.PATTERN_MISMATCH, path, f"Invalid regex in pattern: {patt!r}.")
         allow_empty = _kw(schema, "allow_empty", "allowEmpty", default=True)
         if allow_empty is False and len(s.strip()) == 0:
             self._err(ErrorCode.NOT_ALLOWED_EMPTY, path, "String is empty but allow_empty is False.")
@@ -1480,54 +1772,104 @@ class SimpleJSONSchemaValidator:
                     self._err(ErrorCode.MULTIPLE_OF, path, f"Number {num} is not a multipleOf {mul}.")
 
     # --- Combinators ---
+    #
+    # Combinator branches are *trial* validations: a value's match against a
+    # subschema must be decided WITHOUT mutating it, otherwise one branch's strip
+    # would corrupt the value seen by the next branch (and emit warnings for a
+    # branch that may not even be selected). Probes therefore run in dry-run mode
+    # (extras tolerated, nothing stripped, no warnings). Once the effective branch
+    # is known, it is re-applied against the real value via _apply_subschema() so
+    # the strip and its warnings happen exactly once, against the matched branch.
+
+    def _probe(self, value: Any, sub: Dict[str, Any], path: str, *, tolerate: bool) -> List[ValidationIssue]:
+        # Non-mutating trial validation. ``tolerate=False`` treats undeclared
+        # keys/items as a mismatch (strict discrimination); ``tolerate=True``
+        # ignores them (would-be-stripped), so the branch matches modulo extras.
+        tmp = SimpleJSONSchemaValidator(self.options)
+        tmp._dry_run = True
+        tmp.strip_additional = tolerate
+        return tmp.validate(value, sub, path)
+
+    def _apply_subschema(self, value: Any, sub: Dict[str, Any], path: str) -> None:
+        # Re-validate the matched branch against the real value so its strip and
+        # warnings happen exactly once. No-op while this validator is itself a
+        # dry-run probe: an outer combinator is still deciding.
+        if self._dry_run:
+            return
+        applier = SimpleJSONSchemaValidator(self.options)
+        sub_errs = applier.validate(value, sub, path)
+        self.warnings.extend(applier.warnings)
+        self.errors.extend(sub_errs)
 
     def _validate_anyof(self, value: Any, subs: List[Dict[str, Any]], path: str) -> None:
-        ok = False
-        failures: List[List[ValidationIssue]] = []
+        # Pass 1: exact match (extras are a mismatch). Preserves branch
+        # discrimination and avoids stripping when a branch matches as-is.
+        strict_failures: List[List[ValidationIssue]] = []
         for sub in subs:
-            tmp = SimpleJSONSchemaValidator(self.options)
-            sub_errs = tmp.validate(value, sub, path)
-            if len(sub_errs) == 0:
-                ok = True
-                break
-            failures.append(sub_errs)
-        if not ok:
-            self._err(
-                ErrorCode.ANY_OF_FAILED,
-                path,
-                f"Value does not match anyOf {len(subs)} subschemas.",
-                {"subschema_errors_counts": [len(x) for x in failures]},
-            )
+            errs = self._probe(value, sub, path, tolerate=False)
+            if len(errs) == 0:
+                return
+            strict_failures.append(errs)
+        # Pass 2 (strip mode only): tolerate extras; strip against the first match.
+        if self.strip_additional:
+            for sub in subs:
+                if len(self._probe(value, sub, path, tolerate=True)) == 0:
+                    self._apply_subschema(value, sub, path)
+                    return
+        self._err(
+            ErrorCode.ANY_OF_FAILED,
+            path,
+            f"Value does not match anyOf {len(subs)} subschemas.",
+            {"subschema_errors_counts": [len(x) for x in strict_failures]},
+        )
 
     def _validate_allof(self, value: Any, subs: List[Dict[str, Any]], path: str) -> None:
-        all_ok = True
+        # Every member must hold. In strip mode extras are tolerated (not a
+        # violation); in fail mode they are. Extras are NOT stripped under allOf:
+        # each member's additionalProperties sees the whole instance independently,
+        # so a per-member strip would delete keys a sibling member legitimately
+        # declares. allOf + additionalProperties:false is a JSON Schema anti-pattern;
+        # extras are left intact rather than risk corrupting valid data.
+        # An empty allOf is vacuously satisfied (no members -> no errors), per JSON
+        # Schema; empty anyOf/oneOf instead fail (0 matches). The asymmetry is
+        # intentional and matches the spec.
         merged_errors: List[ValidationIssue] = []
         for sub in subs:
-            tmp = SimpleJSONSchemaValidator(self.options)
-            sub_errs = tmp.validate(value, sub, path)
-            if len(sub_errs) != 0:
-                all_ok = False
-                merged_errors.extend(sub_errs)
+            errs = self._probe(value, sub, path, tolerate=self.strip_additional)
+            if len(errs) != 0:
+                merged_errors.extend(errs)
                 if self.stop_on_first_error:
                     break
-        if not all_ok:
+        if merged_errors:
             self._err(ErrorCode.ALL_OF_FAILED, path, "Value does not satisfy allOf subschemas.",
                       {"errors_count": len(merged_errors)})
 
     def _validate_oneof(self, value: Any, subs: List[Dict[str, Any]], path: str) -> None:
-        matches = 0
-        for sub in subs:
-            tmp = SimpleJSONSchemaValidator(self.options)
-            sub_errs = tmp.validate(value, sub, path)
-            if len(sub_errs) == 0:
-                matches += 1
-        if matches != 1:
-            self._err(ErrorCode.ONE_OF_FAILED, path, f"Value matches {matches} subschemas; expected exactly 1.")
+        # Pass 1: exact match. Preserves discrimination between branches that
+        # differ only by which extras they reject.
+        strict_matches = [sub for sub in subs if len(self._probe(value, sub, path, tolerate=False)) == 0]
+        if len(strict_matches) == 1:
+            return
+        # Only fall back to tolerant matching when no branch matches exactly and
+        # stripping is enabled; >1 strict match is genuine ambiguity.
+        if len(strict_matches) == 0 and self.strip_additional:
+            tolerant_matches = [sub for sub in subs if len(self._probe(value, sub, path, tolerate=True)) == 0]
+            if len(tolerant_matches) == 1:
+                self._apply_subschema(value, tolerant_matches[0], path)
+                return
+            self._err(ErrorCode.ONE_OF_FAILED, path,
+                      f"Value matches {len(tolerant_matches)} subschemas after tolerating extras; expected exactly 1.")
+            return
+        self._err(ErrorCode.ONE_OF_FAILED, path,
+                  f"Value matches {len(strict_matches)} subschemas; expected exactly 1.")
 
     # --- Helpers ---
 
     def _err(self, code: ErrorCode, path: str, message: str, detail: Optional[Dict[str, Any]] = None):
         self.errors.append(ValidationIssue(code=code, path=path, message=message, detail=detail or {}))
+
+    def _warn(self, code: ErrorCode, path: str, message: str, detail: Optional[Dict[str, Any]] = None):
+        self.warnings.append(ValidationIssue(code=code, path=path, message=message, detail=detail or {}))
 
 
 # --------------------------- Expectations Check ---------------------------
@@ -1758,6 +2100,15 @@ def validate_expectations(
                 continue
 
             if pattern is not None and isinstance(node, str):
+                rejection = _pattern_rejection_reason(pattern)
+                if rejection is not None:
+                    if record(ValidationIssue(
+                        code=ErrorCode.UNSAFE_PATTERN,
+                        path=full_path,
+                        message=f"Rejected pattern: {rejection}."
+                    )):
+                        return errors
+                    continue
                 try:
                     matched = re.search(pattern, node) is not None
                 except re.error:
@@ -1836,9 +2187,38 @@ def validate_ai_json(
     expectations: Optional[List[Dict[str, Any]]] = None,
     options: Optional[ValidateOptions] = None
 ) -> ValidationResult:
+    """Validate JSON; a duplicate-key rejection is terminal across all repairs."""
+    try:
+        return _validate_ai_json(input_data, schema, expectations, options)
+    except DuplicateJSONKeyError:
+        return ValidationResult(
+            json_valid=False,
+            likely_truncated=False,
+            errors=[ValidationIssue(
+                code=ErrorCode.DUPLICATE_KEY,
+                path="$",
+                message="JSON object keys must be unique.",
+            )],
+            data=None,
+        )
+
+
+def _validate_ai_json(
+    input_data: Union[str, bytes, Dict[str, Any], List[Any], Any],
+    schema: Optional[Dict[str, Any]] = None,
+    expectations: Optional[List[Dict[str, Any]]] = None,
+    options: Optional[ValidateOptions] = None
+) -> ValidationResult:
     """
     Validate AI output against JSON parseability + optional schema + expectations.
     Returns a non-throwing ValidationResult.
+
+    Input-safety limits: a user-supplied ``schema`` is rejected
+    up front when it breaches the complexity ceilings of
+    ``validate_json_schema_complexity`` (nesting depth, node
+    count, combinatorial product of nested oneOf/anyOf/type unions), and any
+    RecursionError from deeply nested input is converted into a structured
+    issue instead of propagating.
     """
     options = options or ValidateOptions()
     errors: List[ValidationIssue] = []
@@ -1847,11 +2227,53 @@ def validate_ai_json(
     likely_truncated = False
     parsed: Optional[Union[Dict[str, Any], List[Any]]] = None
 
+    # 0) Reject an over-complex schema before any parse/validation work: deep
+    # nesting leads to RecursionError in the recursive validator, and nested
+    # combinators multiply the combinator probes exponentially.
+    # Non-dict schemas are a no-op for the pre-pass; they are reported as a
+    # structured error by the validator itself, as before.
+    if schema is not None:
+        try:
+            validate_json_schema_complexity(schema)
+        except ValueError as exc:
+            errors.append(ValidationIssue(
+                code=ErrorCode.SCHEMA_TOO_COMPLEX,
+                path="$",
+                message=f"JSON Schema rejected: {exc}",
+            ))
+            return ValidationResult(
+                json_valid=False,
+                likely_truncated=False,
+                errors=errors,
+                warnings=warnings,
+                data=None,
+                info=info,
+            )
+
     # 1) Normalize input into a JSON object/array
     raw_str: Optional[str] = None
 
     if isinstance(input_data, (dict, list)):
-        parsed = input_data  # already parsed
+        # Deep-copy already-parsed input so strip-mode never mutates the caller's
+        # object — especially important when validation ultimately fails (the
+        # caller sees json_valid=False and must find its input untouched). The
+        # string/bytes path below parses a fresh object and needs no copy.
+        try:
+            parsed = copy.deepcopy(input_data)
+        except RecursionError:
+            errors.append(ValidationIssue(
+                code=ErrorCode.RECURSION_LIMIT,
+                path="$",
+                message="Input nesting exceeded the recursion budget.",
+            ))
+            return ValidationResult(
+                json_valid=False,
+                likely_truncated=False,
+                errors=errors,
+                warnings=warnings,
+                data=None,
+                info=info,
+            )
         info["source"] = "object"
         info["parse_backend"] = "python_object"
     elif isinstance(input_data, (str, bytes, bytearray)):
@@ -1889,6 +2311,8 @@ def validate_ai_json(
                     path="$",
                     message="Top-level value is not object/array (allow_bare_top_level_scalars=False)."
                 ))
+        except DuplicateJSONKeyError:
+            raise
         except Exception as e:
             # detect truncation on the extracted payload
             likely_truncated, reasons = detect_truncation(payload)
@@ -1910,7 +2334,9 @@ def validate_ai_json(
                             message="Input JSON was repaired by conservative heuristics.",
                             detail={"applied": repair_info.get("applied", []), "counts": repair_info.get("counts", {})}
                         ))
-                    except Exception as e2:
+                    except DuplicateJSONKeyError:
+                        raise
+                    except Exception:
                         # even after repair, failed -> fall back to original error path
                         errors.append(ValidationIssue(
                             code=ErrorCode.PARSE_ERROR,
@@ -1973,7 +2399,17 @@ def validate_ai_json(
 
     # If we got here, parsing succeeded (possibly after repair)
     if options.normalize_curly_quotes.lower() != "never":
-        parsed, normalized_in_data = _normalize_curly_quotes_in_data(parsed)
+        try:
+            parsed, normalized_in_data = _normalize_curly_quotes_in_data(parsed)
+        except RecursionError:
+            # Deeply nested data: skip the cosmetic normalization rather than
+            # breaking the non-throwing contract.
+            normalized_in_data = False
+            warnings.append(ValidationIssue(
+                code=ErrorCode.RECURSION_LIMIT,
+                path="$",
+                message="Curly-quote normalization skipped: data nesting exceeded the recursion budget.",
+            ))
         if normalized_in_data:
             info["curly_quotes_normalization_used"] = True
 
@@ -1983,6 +2419,15 @@ def validate_ai_json(
             v = SimpleJSONSchemaValidator(options)
             schema_errors = v.validate(parsed, schema, "$")
             errors.extend(schema_errors)
+            warnings.extend(v.warnings)
+            if not schema_errors and any(
+                warning.code == ErrorCode.STRIPPED_ADDITIONAL for warning in v.warnings
+            ):
+                # Removing fields/items can invalidate required fields, combinator
+                # branches or array limits that were checked before the removal.
+                final_options = copy.copy(options)
+                final_options.additional_properties_behavior = "fail"
+                errors.extend(SimpleJSONSchemaValidator(final_options).validate(parsed, schema, "$"))
 
         # 3) Expectations (optional)
         if expectations:
@@ -2012,10 +2457,29 @@ def validate_ai_json(
     )
 
 
+def validate_loose_json(
+    content: str,
+    *,
+    expectations: Optional[List[Dict[str, Any]]] = None,
+) -> ValidationResult:
+    """Extract and repair an AI JSON object/array without a schema.
+
+    Text outside the first JSON payload is ignored, markdown fences are
+    unwrapped, and conservative repair passes handle typical AI syntax slips.
+    Top-level scalars and expectation failures still fail validation.
+    """
+
+    return validate_ai_json(
+        content,
+        expectations=expectations,
+        options=make_loose_json_validate_options(),
+    )
+
+
 # ------------------------------ CLI (optional) ------------------------------
 
 def _load_json_file(path: str) -> Any:
-    # Read as bytes, prefer orjson for loads, fallback handled by JSONEngine
+    # File inputs use the same unique-key parser as model outputs.
     with open(path, "rb") as f:
         content = f.read()
     return json_engine.loads(content)
@@ -2057,6 +2521,9 @@ def main():
                         help="Disable the repair pass that quotes simple unquoted object keys.")
     parser.add_argument("--no-strip-comments", action="store_true",
                         help="Disable the repair pass that removes // and /* */ comments.")
+    parser.add_argument("--additional-properties", choices=["strip", "fail"], default="fail",
+                        help="How to react to undeclared keys/items under additionalProperties/"
+                             "additionalItems: false: fail (default, reject) or strip (drop with warnings).")
 
     args = parser.parse_args()
 
@@ -2081,6 +2548,7 @@ def main():
         fix_single_quotes=not args.no_fix_single_quotes,
         quote_unquoted_keys=not args.no_quote_unquoted_keys,
         strip_js_comments=not args.no_strip_comments,
+        additional_properties_behavior=args.additional_properties,
     )
 
     res = validate_ai_json(raw, schema=schema, expectations=expectations, options=opts)

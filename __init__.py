@@ -13,6 +13,8 @@ Main exports:
 
 from ai_json_cleanroom import (
     validate_ai_json,
+    validate_loose_json,
+    make_loose_json_validate_options,
     ValidationResult,
     ValidationIssue,
     ValidateOptions,
@@ -21,9 +23,11 @@ from ai_json_cleanroom import (
     detect_truncation,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __all__ = [
     "validate_ai_json",
+    "validate_loose_json",
+    "make_loose_json_validate_options",
     "ValidationResult",
     "ValidationIssue",
     "ValidateOptions",

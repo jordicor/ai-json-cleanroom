@@ -282,7 +282,7 @@ pip install -e .
 
 ### Optional: Fast JSON Parsing
 ```bash
-# 3.6x faster with orjson
+# Optional faster serialization; parsing still checks duplicate keys
 pip install orjson
 ```
 

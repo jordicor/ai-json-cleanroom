@@ -1,8 +1,9 @@
 """
 Performance benchmark comparing stdlib json vs orjson.
 
-This benchmark demonstrates the performance benefits of using orjson
-over the standard library json module for parsing and serializing JSON.
+Raw parser comparisons are separate from cleanroom validation timings.
+Cleanroom always uses stdlib parsing with a unique-key hook; optional orjson
+accelerates serialization only.
 
 Run with: python tests/benchmark_json_vs_orjson.py
 
@@ -202,30 +203,13 @@ Hope this helps!'''
     print(f"\n  Total time:   {format_time(results['total_time'])}")
     print(f"  Avg per call: {format_time(results['avg_per_call'])}")
 
-    # Summary
     print_section("Summary")
-    if HAS_ORJSON:
-        print("""
-  orjson provides significant performance improvements:
-
-  - 3-4x faster parsing for typical AI-generated JSON
-  - 3-4x faster serialization
-  - Lower memory usage
-  - Better handling of large numbers and unicode
-
-  Installation: pip install orjson
-
-  ai-json-cleanroom automatically uses orjson when available,
-  with transparent fallback to stdlib json.
-        """)
-    else:
-        print("""
-  Install orjson for 3-4x performance improvement:
-
-    pip install orjson
-
-  ai-json-cleanroom will automatically detect and use it.
-        """)
+    print("""
+  Raw json/orjson parser timings above do not include duplicate-key checks.
+  ai-json-cleanroom always parses with stdlib json and a unique-key hook.
+  Optional orjson accelerates serialization only.
+  Use the full-validation timings to assess the cleanroom pipeline.
+    """)
 
     print("\n" + "=" * 70)
     print("  Benchmark Complete!")

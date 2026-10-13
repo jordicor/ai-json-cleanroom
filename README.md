@@ -56,7 +56,7 @@ git clone https://github.com/jordicor/ai-json-cleanroom.git
 cd ai-json-cleanroom
 pip install -e .
 
-# Optional: 3.6x faster parsing
+# Optional: faster JSON serialization
 pip install orjson
 ```
 
@@ -161,7 +161,7 @@ AI JSON Cleanroom is a production-ready, zero-dependency (stdlib only) JSON clea
 - **Truncation Detection** - Knows when output was cut off (saves you API calls!)
 - **Schema Validation** - Validate structure with JSON Schema or simple path rules
 - **Non-Throwing API** - Always returns a result, never crashes your pipeline
-- **Performance** - 3.6x faster parsing with optional `orjson` (but works fine without it)
+- **Unambiguous parsing** - Rejects duplicate keys; optional `orjson` accelerates serialization
 - **Granular Control** - Choose exactly which repairs to apply (or use smart defaults)
 
 > **Pro Tip:** Start with default options - they handle 95% of AI quirks. Only customize when you hit specific issues.
@@ -373,6 +373,41 @@ if not result.json_valid:
 - Combinators: `anyOf`, `oneOf`, `allOf`
 - Constraints: `enum`, `const`, `allow_empty`
 
+**Optional cleanup of undeclared fields/items (v1.2):**
+
+The default still rejects values forbidden by `additionalProperties: false` or
+`additionalItems: false`. To opt into removal with warnings:
+
+```python
+from ai_json_cleanroom import ValidateOptions, validate_ai_json
+
+result = validate_ai_json(
+    '{"name": "Alice", "debug": true}',
+    schema={
+        "type": "object",
+        "required": ["name"],
+        "properties": {"name": {"type": "string"}},
+        "additionalProperties": False,
+    },
+    options=ValidateOptions(additional_properties_behavior="strip"),
+)
+assert result.data == {"name": "Alice"}
+# result.warnings describes the removed fields.
+```
+
+Caller-owned dictionaries and lists are preserved. Missing required values, wrong
+types and invalid enum values still fail. The cleaned output is checked again so
+removal cannot silently invalidate required fields, union branches or array limits.
+Unknown behavior values use rejection, never implicit removal.
+
+For `anyOf`/`oneOf`, exact matches take priority; cleanup is attempted only when no
+branch matches exactly. Ambiguous `oneOf` matches fail. This is a JSON Schema subset,
+not a general schema normalizer: `allOf` tolerates extras in strip mode but leaves
+them intact because different branches can declare different properties. Use the
+default `fail` mode if every `allOf` constraint must reject extras. Put each branch's
+`additionalProperties` alongside its own `properties`; sibling branch properties
+are not visible to it.
+
 ### 5. Path-Based Expectations
 
 Validate specific paths with wildcard support:
@@ -444,6 +479,24 @@ for error in result.errors:
 ```
 
 ---
+
+## Input Limits and Compatibility (v1.2)
+
+- Duplicate object keys, including escaped Unicode equivalents, are rejected with
+  `duplicate_key` before a dictionary can silently overwrite an earlier value.
+  Extraction, built-in repairs and custom repair hooks cannot bypass that check.
+  The duplicate-key error does not echo the key or its value.
+- Explicit `{"type": "null"}` now accepts JSON `null`, including in unions; the
+  string `"null"` remains a different value.
+- Schemas are limited to depth 25 (counting dict/list nesting), 1,000 dictionary
+  nodes and a nested `oneOf`/`anyOf`/type-union product of 10,000.
+- Patterns longer than 500 characters and nested variable-width quantifiers such
+  as `(a+)+$` are rejected. These checks reduce regex risk but are not a timeout:
+  overlapping alternatives such as `(a|aa)+$` can still backtrack heavily.
+- Excessive recursion produces structured errors where guarded. This lightweight
+  validator is not a resource sandbox for arbitrary untrusted schemas or regexes.
+- No required third-party dependencies were added. The file can still be copied
+  directly into another project. See [release notes](CHANGELOG.md).
 
 ## Understanding the Configuration Options
 
@@ -1076,7 +1129,7 @@ print(f"Found JSON in: {result.info['source']}")
 ### "Performance is slow with large outputs"
 
 **Solutions:**
-1. **Install orjson:** `pip install orjson` for 3.6x speedup
+1. **Measure parsing and serialization separately:** optional `orjson` accelerates serialization; parsing always checks duplicate keys with stdlib `json`.
 2. **Disable unnecessary repairs:**
    ```python
    options = ValidateOptions(
@@ -1170,7 +1223,7 @@ class ValidationResult:
 **Metadata in `info`:**
 - `source`: How JSON was found (`"raw"`, `"code_fence"`, `"balanced_block"`, `"object"`)
 - `extraction`: Details about extraction process
-- `parse_backend`: Which parser was used (`"orjson"` or `"json"`)
+- `parse_backend`: `"json"` for text/bytes, or `"python_object"` for an already parsed object
 - `curly_quotes_normalization_used`: Whether typographic quotes were normalized
 - `repair`: Details about applied repairs (if any)
 
@@ -1221,6 +1274,9 @@ class ValidateOptions:
 
     # Custom repair hooks (new in v1.1)
     custom_repair_hooks: Optional[List[Callable]] = None
+
+    # Additional fields/items (new in v1.2; cleaning is opt-in)
+    additional_properties_behavior: str = "fail"  # "fail" or "strip"
 ```
 
 **Curly quotes normalization modes:**
@@ -1235,6 +1291,11 @@ Enumeration of validation error types.
 ```python
 class ErrorCode(str, Enum):
     PARSE_ERROR = "parse_error"
+    DUPLICATE_KEY = "duplicate_key"
+    SCHEMA_TOO_COMPLEX = "schema_too_complex"
+    RECURSION_LIMIT = "recursion_limit"
+    UNSAFE_PATTERN = "unsafe_pattern"
+    STRIPPED_ADDITIONAL = "stripped_additional"  # Warning: fields/items removed
     TRUNCATED = "truncated"
     MISSING_REQUIRED = "missing_required"
     TYPE_MISMATCH = "type_mismatch"
@@ -1254,6 +1315,21 @@ class ErrorCode(str, Enum):
 ```
 
 ### Helper Functions
+
+`validate_loose_json(content, expectations=None)` extracts and conservatively
+repairs an object/array without a schema. It accepts common AI wrappers and
+JSON5-like syntax, rejects duplicate keys and top-level scalars, and enforces any
+path expectations. `make_loose_json_validate_options()` returns fresh options for
+this workflow; callers can customize them for `validate_ai_json()`.
+
+```python
+from ai_json_cleanroom import validate_loose_json
+
+result = validate_loose_json("Result: {'name': 'Alice'}")
+assert result.data == {"name": "Alice"}
+```
+
+Advanced extraction helpers:
 
 ```python
 def extract_json_payload(
@@ -1291,14 +1367,8 @@ echo '{"name": "test"}' | python ai_json_cleanroom.py --input -
 # Testing a saved AI response:
 python ai_json_cleanroom.py --input gpt_response.txt
 
-# See exactly what gets fixed:
-python ai_json_cleanroom.py --input messy.json --verbose
-
-# Output shows:
-# Fixed 3 single-quoted strings
-# Quoted 2 unquoted keys
-# Normalized 4 curly quotes
-# Removed 2 trailing commas
+# Inspect warnings and repair metadata in the JSON report:
+python ai_json_cleanroom.py --input messy.json
 
 # Validate inline text
 python ai_json_cleanroom.py --input '{"name": "Alice", "age": 30}'
@@ -1313,25 +1383,27 @@ python ai_json_cleanroom.py --input response.txt --expectations expectations.jso
 ### Understanding Repair Behavior
 
 ```bash
-# See what would be fixed without actually fixing:
-python ai_json_cleanroom.py --input data.json --dry-run
+# Validate without applying repairs:
+python ai_json_cleanroom.py --input data.json --no-repair
 
 # Test different repair strategies:
 python ai_json_cleanroom.py --input data.json \
   --normalize-curly-quotes never \
-  --no-fix-single-quotes \
-  --verbose  # See the difference
+  --no-fix-single-quotes
 
 # Process multiple files:
 for file in responses/*.json; do
     echo "Processing $file..."
-    python ai_json_cleanroom.py --input "$file" --output-clean
+    python ai_json_cleanroom.py --input "$file"
 done
 ```
 
 ### Options
 
 ```bash
+# Opt into removal of undeclared fields/items (default: fail)
+python ai_json_cleanroom.py --input response.json --schema schema.json --additional-properties strip
+
 # Disable extraction (input must be pure JSON)
 python ai_json_cleanroom.py --input data.json --no-extract
 
@@ -1392,7 +1464,7 @@ The CLI outputs a JSON result with validation details:
   },
   "info": {
     "source": "code_fence",
-    "parse_backend": "orjson",
+    "parse_backend": "json",
     "curly_quotes_normalization_used": true
   }
 }
@@ -1566,43 +1638,18 @@ if "repair" in result.info:
 
 ## Performance
 
-### Benchmarks
+Parsing always uses stdlib `json` with an object-pairs hook so duplicate keys are
+rejected before values are overwritten. This adds parsing work compared with raw
+`orjson.loads`; installing `orjson` does not bypass the check.
 
-Performance comparison with stdlib `json` vs `orjson`:
+Optional `orjson` accelerates serialization where its options are compatible.
+Indentation greater than 2 and ASCII-only output use stdlib serialization.
+There are no mandatory runtime dependencies.
 
-| Operation | stdlib json | orjson | Speedup |
-|-----------|------------|--------|---------|
-| Parse (simple) | 1.8 µs | 0.4 µs | **4.35x** |
-| Parse (complex) | 20.2 µs | 8.3 µs | **2.42x** |
-| Dump (simple) | 2.1 µs | 0.2 µs | **10.83x** |
-| Dump (complex) | 23.8 µs | 2.2 µs | **11.04x** |
-
-*Benchmarks on Python 3.11.5, Intel Core i9-11900K @ 3.50GHz*
-
-### Repair Overhead
-
-Repair operations add minimal overhead:
-
-| Scenario | Time | Notes |
-|----------|------|-------|
-| Clean JSON (no repairs) | ~1 µs | Direct parse with orjson |
-| Markdown extraction + parse | 84 µs | Full validation pipeline |
-| Multiple repairs + parse | 218 µs | Fix quotes, constants, trailing commas |
-
-*Average times from validation pipeline benchmarks (1000 iterations)*
-
-### When to Use orjson
-
-Install `orjson` for production use when:
-- Processing high volumes of AI outputs
-- Latency matters (API endpoints, real-time systems)
-- Large JSON payloads (>10KB)
-
-```bash
-pip install orjson
-```
-
-The library automatically uses `orjson` when available, with transparent fallback to stdlib `json`.
+Run `python tests/benchmark_json_vs_orjson.py` to measure your own workload.
+The raw parser comparisons in that script are not cleanroom parsing timings;
+the full-validation sections measure extraction, unique-key parsing and repairs.
+Earlier parsing-speed claims do not apply to v1.2.
 
 ---
 

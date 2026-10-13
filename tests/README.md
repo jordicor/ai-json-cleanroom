@@ -47,7 +47,7 @@ python tests/benchmark_json_vs_orjson.py
 
 ### Core Test Modules
 
-- **`test_json_engine.py`** - Tests for JSON parsing engine (orjson/stdlib)
+- **`test_json_engine.py`** - Tests for unique-key JSON parsing and optional serialization
   - Parse simple and complex JSON
   - Unicode handling
   - Large numbers
@@ -230,18 +230,17 @@ These tests are designed to run in CI/CD pipelines:
   - Repair safeguards
   - Schema validation completeness
 
-## Benchmark Results
+## Regression Checks and Benchmarks
 
-Typical performance on modern hardware (Python 3.11):
+Run `python -m pytest tests/` for extraction, repair, schema and path validation,
+duplicate-key rejection, input complexity limits, optional cleanup and standalone
+CLI checks. The CLI checks copy only the module and run Python with `-I -S` to
+exclude installed dependencies and project imports.
 
-| Operation | stdlib json | orjson | Speedup |
-|-----------|------------|--------|---------|
-| Parse simple | ~100 µs | ~28 µs | **3.6x** |
-| Parse complex | ~450 µs | ~125 µs | **3.6x** |
-| Serialize simple | ~85 µs | ~24 µs | **3.5x** |
-| Serialize complex | ~380 µs | ~105 µs | **3.6x** |
-
-Run `python tests/benchmark_json_vs_orjson.py` for results on your system.
+Run `python tests/benchmark_json_vs_orjson.py` for timings on your system. Raw
+stdlib/orjson parsing benchmarks compare those libraries directly; cleanroom
+always parses with the stdlib unique-key hook. Optional orjson only accelerates
+serialization. Full-validation sections measure the current cleanroom pipeline.
 
 ## Troubleshooting Tests
 
@@ -266,7 +265,7 @@ ls tests/fixtures/
 # Install orjson for full benchmark
 pip install orjson
 
-# Or run benchmark without orjson (slower but works)
+# Or run the stdlib and full-validation benchmarks without orjson
 python tests/benchmark_json_vs_orjson.py
 ```
 

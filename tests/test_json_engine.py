@@ -1,5 +1,5 @@
 """
-Tests for JSONEngine (orjson-first with stdlib fallback).
+Tests for strict JSON parsing and optional fast serialization.
 """
 
 import pytest
@@ -19,7 +19,7 @@ class TestJSONEngine:
 
         assert result.json_valid
         assert result.data == simple_json
-        assert result.info.get("parse_backend") in ["orjson", "json"]
+        assert result.info.get("parse_backend") == "json"
 
     def test_complex_parse(self, complex_json):
         """Test parsing complex nested JSON."""
@@ -31,21 +31,14 @@ class TestJSONEngine:
         assert len(result.data["users"]) == 3
         assert result.data["statistics"]["total_users"] == 3
 
-    def test_orjson_backend_preference(self):
-        """Test that orjson is preferred when available."""
-        try:
-            import orjson
-            has_orjson = True
-        except ImportError:
-            has_orjson = False
-
-        json_str = '{"name": "test", "value": 42}'
-        result = validate_ai_json(json_str)
-
-        if has_orjson:
-            assert result.info.get("parse_backend") == "orjson"
-        else:
-            assert result.info.get("parse_backend") == "json"
+    def test_parser_preserves_duplicate_detection_with_optional_orjson(self):
+        """Installing orjson must not silently disable unique-key checking."""
+        result = validate_ai_json('{"name": "test", "value": 42}')
+        assert result.json_valid
+        assert result.info["parse_backend"] == "json"
+        duplicate = validate_ai_json('{"value": 1, "value": 2}')
+        assert not duplicate.json_valid
+        assert duplicate.errors[0].code == "duplicate_key"
 
     def test_unicode_handling(self):
         """Test proper handling of unicode characters."""
